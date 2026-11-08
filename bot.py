@@ -90,8 +90,21 @@ adm_dp = Dispatcher()
 log_dp = Dispatcher()
 
 adm = Router()
-adm.message.filter(F.from_user.id.in_(ADMINS))
-adm.callback_query.filter(F.from_user.id.in_(ADMINS))
+
+
+@adm.message.outer_middleware()
+async def adm_msg_auth(handler, event: Message, data: dict):
+    if not event.from_user or event.from_user.id not in ADMINS:
+        uid = event.from_user.id if event.from_user else "Unknown"
+        return await event.answer(f"⛔ Access denied. Your ID (<code>{uid}</code>) is not in ADMIN_IDS.", parse_mode="HTML")
+    return await handler(event, data)
+
+
+@adm.callback_query.outer_middleware()
+async def adm_cb_auth(handler, event: CallbackQuery, data: dict):
+    if not event.from_user or event.from_user.id not in ADMINS:
+        return await event.answer("⛔ Access denied.", show_alert=True)
+    return await handler(event, data)
 
 pool: asyncpg.Pool = None
 USER_LOCKS: dict[int, asyncio.Lock] = {}
@@ -161,6 +174,11 @@ def KBtn(text: str, style: str = None) -> KeyboardButton:
 
 
 def strip_button_extras(markup, strip_style=False, strip_emoji=True):
+    if isinstance(markup, ReplyKeyboardMarkup):
+        new_kb = []
+        for row in markup.keyboard:
+            new_kb.append([KeyboardButton(text=b.text) for b in row])
+        return ReplyKeyboardMarkup(keyboard=new_kb, resize_keyboard=True, is_persistent=True)
     if not isinstance(markup, InlineKeyboardMarkup):
         return markup
     new_rows = []
@@ -1134,7 +1152,6 @@ async def cmd_start(m: Message, state: FSMContext):
 
 
 @dp.message(Command("products"), StateFilter("*"))
-@dp.message(F.text.in_({"🛍 Shop", "🛍️ Shop", "Shop"}), StateFilter("*"))
 async def cmd_products(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1142,13 +1159,22 @@ async def cmd_products(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
+@dp.message(F.text.in_({"🛍 Shop", "🛍️ Shop", "Shop"}), StateFilter("*"))
+async def btn_products(m: Message, state: FSMContext):
+    await cmd_products(m, state)
+
+
 @dp.message(Command("deposit"), StateFilter("*"))
-@dp.message(F.text.in_({"💳 Top Up", "Top Up"}), StateFilter("*"))
 async def cmd_deposit(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
     txt, kb = deposit_menu_view()
     await safe_answer(m, txt, reply_markup=kb)
+
+
+@dp.message(F.text.in_({"💳 Top Up", "Top Up"}), StateFilter("*"))
+async def btn_deposit(m: Message, state: FSMContext):
+    await cmd_deposit(m, state)
 
 
 @dp.message(Command("orders"), StateFilter("*"))
@@ -1160,7 +1186,6 @@ async def cmd_orders(m: Message, state: FSMContext):
 
 
 @dp.message(Command("settings", "profile"), StateFilter("*"))
-@dp.message(F.text.in_({"👤 Profile", "Profile"}), StateFilter("*"))
 async def cmd_profile(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1168,13 +1193,22 @@ async def cmd_profile(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
+@dp.message(F.text.in_({"👤 Profile", "Profile"}), StateFilter("*"))
+async def btn_profile(m: Message, state: FSMContext):
+    await cmd_profile(m, state)
+
+
 @dp.message(Command("support"), StateFilter("*"))
-@dp.message(F.text.in_({"💬 Support", "Support"}), StateFilter("*"))
 async def cmd_support(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
     txt, kb = support_view()
     await safe_answer(m, txt, reply_markup=kb)
+
+
+@dp.message(F.text.in_({"💬 Support", "Support"}), StateFilter("*"))
+async def btn_support(m: Message, state: FSMContext):
+    await cmd_support(m, state)
 
 
 @dp.message(Command("search"), StateFilter("*"))
@@ -2093,11 +2127,19 @@ def back_adm():
     return b.as_markup()
 
 
-@adm.message(Command("start", "admin", "cancel"), StateFilter("*"))
-@adm.message(F.text.in_({"🛠 Admin Panel", "Admin Panel", "/admin", "/start"}), StateFilter("*"))
-async def adm_cmd(m: Message, state: FSMContext):
+@adm.message(CommandStart(), StateFilter("*"))
+async def adm_start_cmd(m: Message, state: FSMContext):
     await state.clear()
-    await safe_answer(m, "⚡", reply_markup=adm_reply_kb())
+    await safe_answer(
+        m,
+        "🛠 <b>Admin Control Panel</b>\nManage products, Top 3 Favourites, payments, balances, and store settings:",
+        reply_markup=adm_menu(),
+    )
+
+
+@adm.message(Command("admin", "cancel", "menu"), StateFilter("*"))
+async def adm_panel_cmd(m: Message, state: FSMContext):
+    await state.clear()
     await safe_answer(
         m,
         "🛠 <b>Admin Control Panel</b>\nManage products, Top 3 Favourites, payments, balances, and store settings:",
@@ -2106,7 +2148,7 @@ async def adm_cmd(m: Message, state: FSMContext):
 
 
 @adm.message(F.text == "⏳ Pending", StateFilter("*"))
-async def adm_Quick_pending(m: Message, state: FSMContext):
+async def adm_quick_pending(m: Message, state: FSMContext):
     await state.clear()
     txt, kb = await build_adm_pending_view()
     await safe_answer(m, txt, reply_markup=kb)
@@ -2903,13 +2945,17 @@ async def addbal(m: Message, state: FSMContext):
         await m.answer("Usage: <code>/addbal USER_ID AMOUNT</code>", parse_mode="HTML")
 
 
+@adm.message()
+async def adm_fallback_msg(m: Message, state: FSMContext):
+    await state.clear()
+    await safe_answer(
+        m,
+        "🛠 <b>Admin Control Panel</b>\nManage products, Top 3 Favourites, payments, balances, and store settings:",
+        reply_markup=adm_menu(),
+    )
+
+
 adm_dp.include_router(adm)
-
-
-@adm_dp.message()
-async def adm_unauthorized(m: Message):
-    if m.from_user and m.from_user.id not in ADMINS:
-        await m.answer(f"⛔ Access denied. Your User ID (<code>{m.from_user.id}</code>) is not in ADMIN_IDS.", parse_mode="HTML")
 
 
 # Log Bot start handler so admins can initialize chat with the Log Bot
@@ -3000,16 +3046,20 @@ async def main():
     await setup_bot_commands()
     await bot.delete_webhook(drop_pending_updates=True)
 
-    tasks = [dp.start_polling(bot, handle_signals=False)]
+    upd_types = ["message", "callback_query"]
+    tasks = [dp.start_polling(bot, allowed_updates=upd_types, handle_signals=False)]
     if ADMIN_BOT_TOKEN and ADMIN_BOT_TOKEN != BOT_TOKEN:
         await admin_bot.delete_webhook(drop_pending_updates=True)
-        tasks.append(adm_dp.start_polling(admin_bot, handle_signals=False))
+        logging.info("Starting Admin Bot polling for ADMINS=%s", ADMINS)
+        tasks.append(adm_dp.start_polling(admin_bot, allowed_updates=upd_types, handle_signals=False))
     else:
+        logging.warning("ADMIN_BOT_TOKEN not set or same as BOT_TOKEN; attaching admin router to main bot")
         dp.include_router(adm)
 
     if LOG_BOT_TOKEN and LOG_BOT_TOKEN not in (BOT_TOKEN, ADMIN_BOT_TOKEN):
         await log_bot.delete_webhook(drop_pending_updates=True)
-        tasks.append(log_dp.start_polling(log_bot, handle_signals=False))
+        logging.info("Starting Log Bot polling")
+        tasks.append(log_dp.start_polling(log_bot, allowed_updates=upd_types, handle_signals=False))
 
     await asyncio.gather(*tasks)
 
