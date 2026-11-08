@@ -1,6 +1,6 @@
 import os, re, hmac, hashlib, time, uuid, json, logging, asyncio, html as htmllib
 from decimal import Decimal, ROUND_HALF_UP
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urlparse
 
 import aiohttp, asyncpg
 from aiohttp import web
@@ -19,7 +19,9 @@ esc = lambda t: htmllib.escape(str(t))
 
 # ================= CONFIG (সব Render Environment Variable থেকে) =================
 BOT_TOKEN = E("BOT_TOKEN")
-DATABASE_URL = (E("DATABASE_URL") or "").split("?")[0]
+DATABASE_URL = (E("DATABASE_URL") or "").strip().strip("\"'").split("?")[0]
+# বিকল্প: আলাদা আলাদা ভ্যারিয়েবল (পাসওয়ার্ডে বিশেষ চিহ্ন থাকলেও সমস্যা হয় না)
+DB_HOST = (E("DB_HOST") or "").strip()
 API_BASE = E("SHOP_API_BASE", "https://safwantigershopbot-production.up.railway.app/api").rstrip("/")
 API_KEY = E("SHOP_KEY")
 ADMINS = [int(x) for x in re.split(r"[,\s]+", E("ADMIN_IDS", "")) if x.strip().isdigit()]
@@ -126,7 +128,15 @@ def sell_price(p):
 # ================= DB =================
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, ssl="require", statement_cache_size=0, min_size=1, max_size=5)
+    opts = dict(ssl="require", statement_cache_size=0, min_size=1, max_size=5)
+    if DB_HOST:
+        kw = dict(host=DB_HOST, port=int(E("DB_PORT", "5432")), user=(E("DB_USER") or "").strip(),
+                  password=E("DB_PASSWORD") or "", database=(E("DB_NAME") or "postgres").strip())
+        logging.info("DB connect: user=%s host=%s port=%s", kw["user"], kw["host"], kw["port"])
+        pool = await asyncpg.create_pool(**kw, **opts)
+    else:
+        logging.info("DB connect via DATABASE_URL: host=%s", urlparse(DATABASE_URL).hostname)
+        pool = await asyncpg.create_pool(DATABASE_URL, **opts)
     await pool.execute("""
     CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, balance NUMERIC(18,2) NOT NULL DEFAULT 0,
       username TEXT, name TEXT, created TIMESTAMPTZ DEFAULT now());
@@ -141,6 +151,12 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS bkash(id SERIAL PRIMARY KEY, user_id BIGINT, trx TEXT UNIQUE,
       amount_bdt NUMERIC(18,2), status TEXT DEFAULT 'pending', created TIMESTAMPTZ DEFAULT now());
     """)
+    # Supabase-এ বাইরে থেকে API দিয়ে টেবিল পড়া/লেখা বন্ধ রাখতে RLS চালু (বট নিজের postgres ইউজারে চলে, তাই সমস্যা নেই)
+    for t in ("users", "deposits", "orders", "overrides", "settings", "bkash", "notes"):
+        try:
+            await pool.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
+        except Exception as e:
+            logging.warning("RLS %s: %s", t, e)
     for r in await pool.fetch("SELECT pid, price FROM overrides"):
         OVR[r["pid"]] = r["price"]
     for r in await pool.fetch("SELECT pid, note FROM notes"):
