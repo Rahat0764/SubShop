@@ -15,19 +15,21 @@ import aiohttp
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message,
     CallbackQuery,
-     ErrorEvent,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
     BotCommand,
     BotCommandScopeDefault,
+    BotCommandScopeChat,
+    BotCommandScopeAllPrivateChats,
     MenuButtonCommands,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -42,7 +44,6 @@ esc = lambda t: htmllib.escape(str(t))
 BOT_TOKEN = (E("BOT_TOKEN") or "").strip()
 ADMIN_BOT_TOKEN = (E("ADMIN_BOT_TOKEN") or "").strip()
 LOG_BOT_TOKEN = (E("LOG_BOT_TOKEN") or "").strip()
-LOG_CHAT_ID = (E("LOG_CHAT_ID") or "").strip()
 
 DATABASE_URL = (E("DATABASE_URL") or "").strip().strip("\"'").split("?")[0]
 DB_HOST = (E("DB_HOST") or "").strip()
@@ -55,7 +56,7 @@ API_BASE = E("SHOP_API_BASE", "https://safwantigershopbot-production.up.railway.
 API_KEY = (E("SHOP_KEY") or "").strip()
 SHOP_NAME = (E("SHOP_NAME") or "SubStore").strip()
 
-ADMINS = [int(x) for x in re.split(r"[,\s]+", E("ADMIN_IDS", "")) if x.strip().isdigit()]
+ADMINS = [int(x) for x in re.findall(r"\d+", E("ADMIN_IDS", ""))]
 ADMIN_USERNAME = (E("ADMIN_USERNAME") or "").strip().lstrip("@")
 WHATSAPP_LINK = (E("WHATSAPP_LINK") or "").strip()
 CONTACT_NUMBER = (E("CONTACT_NUMBER") or E("PHONE_NUMBER") or "").strip()
@@ -79,13 +80,15 @@ try:
 except Exception:
     CUSTOM_EMOJI_MAP = {}
 
-# Bot instances (Customer bot, Admin bot, Log bot)
+# Bot instances
 bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 admin_bot = Bot(ADMIN_BOT_TOKEN) if ADMIN_BOT_TOKEN else bot
 log_bot = Bot(LOG_BOT_TOKEN) if LOG_BOT_TOKEN else admin_bot
 
 dp = Dispatcher()
 adm_dp = Dispatcher()
+log_dp = Dispatcher()
+
 adm = Router()
 adm.message.filter(F.from_user.id.in_(ADMINS))
 adm.callback_query.filter(F.from_user.id.in_(ADMINS))
@@ -129,7 +132,7 @@ class Adm(StatesGroup):
     man_amt = State()
 
 
-# Button helpers with style and custom emoji fallback
+# Button builders and safe message helpers
 def Btn(text: str, style: str = None, icon_custom_emoji_id: str = None, **kwargs) -> InlineKeyboardButton:
     payload = {"text": text, **kwargs}
     if style in ("success", "primary", "danger"):
@@ -189,7 +192,10 @@ async def safe_bot_send(target_bot: Bot, chat_id: int | str, text: str, reply_ma
                 pass
         if "STYLE" in err or "BUTTON" in err:
             clean_kb = strip_button_extras(reply_markup, strip_style=True, strip_emoji=True)
-            return await target_bot.send_message(chat_id, text, reply_markup=clean_kb, parse_mode=parse_mode, **kwargs)
+            try:
+                return await target_bot.send_message(chat_id, text, reply_markup=clean_kb, parse_mode=parse_mode, **kwargs)
+            except Exception:
+                pass
         logging.warning("send_message failed to %s: %s", chat_id, e)
         return None
 
@@ -348,7 +354,6 @@ CAT_OVR = {}
 
 
 def detect_category(p: dict) -> str:
-    """Matches category strictly based on earliest brand keyword appearance in the product name."""
     pid = str(p["id"])
     if pid in CAT_OVR and CAT_OVR[pid] in CAT_MAP:
         return CAT_OVR[pid]
@@ -396,7 +401,7 @@ def detect_product_icon(p: dict) -> tuple[str, str | None]:
     return cat_icon, ce_id
 
 
-# Contact helpers (only used in /support and failed manual verification window)
+# Contact helpers (only shown in /support and failed manual verification window)
 def get_whatsapp_url(ctx=""):
     w = (ST.get("whatsapp_link") or WHATSAPP_LINK or "").strip()
     num = (ST.get("contact_number") or CONTACT_NUMBER or "").strip()
@@ -559,7 +564,6 @@ async def init_db():
     );
     """)
 
-    # Safe schema migrations for existing tables
     await pool.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_code TEXT;")
     await pool.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS pay_method TEXT DEFAULT 'wallet';")
     await pool.execute("ALTER TABLE bkash ADD COLUMN IF NOT EXISTS usdt_amount NUMERIC(18,2);")
@@ -601,6 +605,21 @@ async def init_db():
         ST["show_empty_folders"] = s_map["show_empty_folders"] == "1"
 
 
+async def bd_now() -> str:
+    return await pool.fetchval("SELECT to_char(now() AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD HH12:MI:SS AM')")
+
+
+async def notify_admin(text: str, reply_markup=None):
+    for a in ADMINS:
+        await safe_bot_send(admin_bot, a, text, reply_markup=reply_markup)
+
+
+async def send_log(text: str):
+    """Sends all activity logs directly to ADMIN_IDS via the dedicated Log Bot."""
+    for a in ADMINS:
+        await safe_bot_send(log_bot, a, text)
+
+
 async def save_favs():
     async with pool.acquire() as c:
         async with c.transaction():
@@ -610,10 +629,21 @@ async def save_favs():
 
 
 async def ensure_user(u):
-    await pool.execute(
-        "INSERT INTO users(id,username,name) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET username=$2, name=$3",
+    is_new = await pool.fetchval(
+        "INSERT INTO users(id,username,name) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING RETURNING id",
         u.id, u.username, u.full_name,
     )
+    if is_new:
+        t_str = await bd_now()
+        await send_log(
+            f"👤 <b>NEW USER REGISTERED</b>\n\n"
+            f"🏷 <b>Name:</b> {esc(u.full_name)}\n"
+            f"🔗 <b>Username:</b> @{esc(u.username or 'N/A')}\n"
+            f"🆔 <b>User ID:</b> <code>{u.id}</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
+    else:
+        await pool.execute("UPDATE users SET username=$2, name=$3 WHERE id=$1", u.id, u.username, u.full_name)
 
 
 async def balance(uid):
@@ -661,24 +691,6 @@ async def credit_deposit(method, txid, uid, amt):
                 return False
             await c.execute("UPDATE users SET balance=balance+$2 WHERE id=$1", uid, amt)
             return True
-
-
-async def notify_admin(text: str, reply_markup=None):
-    """Sends actionable alerts to all admins via the dedicated Admin Bot."""
-    for a in ADMINS:
-        await safe_bot_send(admin_bot, a, text, reply_markup=reply_markup)
-
-
-async def send_log(text: str):
-    """Sends purchase and deposit logs via the dedicated Log Bot."""
-    if LOG_CHAT_ID:
-        targets = [x.strip() for x in LOG_CHAT_ID.split(",") if x.strip()]
-        for t in targets:
-            cid = int(t) if t.lstrip("-").isdigit() else t
-            await safe_bot_send(log_bot, cid, text)
-    else:
-        for a in ADMINS:
-            await safe_bot_send(log_bot, a, text)
 
 
 # Upstream Shop API
@@ -757,7 +769,6 @@ async def find(pid, force=False):
 
 
 async def api_order(pid, qty, rid):
-    """Returns (outcome, data) where outcome is 'ok', 'failed', or 'timeout'."""
     send_pid = int(pid) if str(pid).isdigit() else pid
     try:
         async with aiohttp.ClientSession() as s:
@@ -792,7 +803,6 @@ async def verify_binance(txid: str):
         return None
     txid_clean = txid.strip()
     async with aiohttp.ClientSession() as s:
-        # 1. Query Binance Pay history without start/end filter (returns recent 90 days up to limit=100)
         try:
             now = int(time.time() * 1000)
             params = {"limit": 100, "timestamp": now, "recvWindow": 20000}
@@ -816,7 +826,6 @@ async def verify_binance(txid: str):
         except Exception as e:
             logging.warning("binance pay check error: %s", e)
 
-        # 2. Query Binance On-Chain Deposit history
         try:
             now2 = int(time.time() * 1000)
             dep_params = {
@@ -911,10 +920,6 @@ async def verify_bybit(txid: str):
 
 
 async def run_two_stage_verification(msg: Message, method: str, txid: str):
-    """
-    Stage 1 (30s): Ledger Synchronization progress bar, followed by API lookup.
-    Stage 2 (10s): Payment Confirmation progress bar, returning verified USDT amount or None.
-    """
     bars_30 = [
         ("▰▱▱▱▱▱", "15%", "25s"),
         ("▰▰▱▱▱▱", "35%", "20s"),
@@ -932,7 +937,6 @@ async def run_two_stage_verification(msg: Message, method: str, txid: str):
         )
         await asyncio.sleep(5)
 
-    # Perform the exchange API call right after the 30s sync completes
     try:
         amt = await (verify_binance(txid) if method == "binance" else verify_bybit(txid))
     except Exception as e:
@@ -955,11 +959,12 @@ async def run_two_stage_verification(msg: Message, method: str, txid: str):
     return amt
 
 
-# Order fulfillment helper (used by Wallet Pay, Direct Pay, and Admin Manual Approval)
+# Order fulfillment helper
 async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict, qty: int, total: Decimal, pay_method: str, target_msg=None):
     base = p["price"] * qty
     rid = f"u{uid}-{uuid.uuid4().hex[:10]}"
     order_code = f"ORD-{int(time.time()) % 1000000:06d}-{uuid.uuid4().hex[:4].upper()}"
+    t_str = await bd_now()
 
     outcome, data = await api_order(p["id"], qty, rid)
     if not isinstance(data, dict):
@@ -971,7 +976,6 @@ async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict,
     )
 
     if outcome == "timeout":
-        # Do NOT auto-refund on timeout; hold as pending so admin can check upstream first
         oid = await pool.fetchval(ins, order_code, uid, str(p["id"]), p["name"], qty, total, base, rid, pay_method, "pending", str(data)[:500])
         ab = InlineKeyboardBuilder()
         ab.row(
@@ -986,6 +990,14 @@ async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict,
             f"💵 Paid: <b>{total} USDT</b> ({pay_method.upper()})\n\n"
             f"<i>Upstream API timed out. Check if the order succeeded upstream before refunding.</i>",
             reply_markup=ab.as_markup(),
+        )
+        await send_log(
+            f"⚠️ <b>ORDER PENDING (API TIMEOUT)</b>\n\n"
+            f"🆔 <b>Order ID:</b> <code>{order_code}</code> (#{oid})\n"
+            f"👤 <b>User:</b> {esc(u_name)} (@{esc(u_username or 'N/A')}) <code>{uid}</code>\n"
+            f"📦 <b>Item:</b> {esc(p['name'])} ×{qty}\n"
+            f"💵 <b>Paid:</b> <code>{total} USDT</code> ({pay_method.upper()})\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
         )
         txt = (
             f"⏳ <b>Order Processing (#{order_code})</b>\n\n"
@@ -1008,6 +1020,14 @@ async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict,
             f"👤 {esc(u_name)} (<code>{uid}</code>)\n"
             f"📦 {esc(p['name'])} ×{qty}\n"
             f"Reason: <code>{esc(str(data)[:300])}</code>"
+        )
+        await send_log(
+            f"❌ <b>ORDER FAILED (AUTO-REFUNDED)</b>\n\n"
+            f"🆔 <b>Order ID:</b> <code>{order_code}</code> (#{oid})\n"
+            f"👤 <b>User:</b> {esc(u_name)} (@{esc(u_username or 'N/A')}) <code>{uid}</code>\n"
+            f"📦 <b>Item:</b> {esc(p['name'])} ×{qty}\n"
+            f"💵 <b>Refunded:</b> <code>{total} USDT</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
         )
         txt = (
             f"❌ <b>Order Failed</b>\n"
@@ -1050,9 +1070,8 @@ async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict,
     else:
         await safe_bot_send(bot, uid, txt, reply_markup=b.as_markup())
 
-    bd_time = await pool.fetchval("SELECT to_char(now() AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD HH12:MI:SS AM')")
     await send_log(
-        f"🛍 <b>NEW ORDER LOG</b>\n\n"
+        f"🛍 <b>PURCHASE SUCCESSFUL</b>\n\n"
         f"🆔 <b>Order ID:</b> <code>{order_code}</code> (#{oid})\n"
         f"👤 <b>Customer:</b> {esc(u_name)} (@{esc(u_username or 'N/A')})\n"
         f"🔢 <b>User ID:</b> <code>{uid}</code>\n"
@@ -1061,7 +1080,7 @@ async def execute_product_order(uid: int, u_name: str, u_username: str, p: dict,
         f"💳 <b>Method:</b> <code>{pay_method.upper()}</code>\n"
         f"💵 <b>Total Paid:</b> <code>{total} USDT</code>\n"
         f"📈 <b>Net Profit:</b> <code>{q2(total - base)} USDT</code>\n"
-        f"🕒 <b>Time (BD):</b> <code>{bd_time}</code>"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
     )
     return True
 
@@ -1104,8 +1123,8 @@ async def welcome_text(user) -> str:
     )
 
 
-# Customer Bot commands
-@dp.message(CommandStart())
+# Customer Bot commands (StateFilter("*") ensures commands work from any state)
+@dp.message(CommandStart(), StateFilter("*"))
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1114,8 +1133,8 @@ async def cmd_start(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=main_menu())
 
 
-@dp.message(Command("products"))
-@dp.message(F.text.in_({"🛍 Shop", "🛍️ Shop", "Shop"}))
+@dp.message(Command("products"), StateFilter("*"))
+@dp.message(F.text.in_({"🛍 Shop", "🛍️ Shop", "Shop"}), StateFilter("*"))
 async def cmd_products(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1123,8 +1142,8 @@ async def cmd_products(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("deposit"))
-@dp.message(F.text.in_({"💳 Top Up", "Top Up"}))
+@dp.message(Command("deposit"), StateFilter("*"))
+@dp.message(F.text.in_({"💳 Top Up", "Top Up"}), StateFilter("*"))
 async def cmd_deposit(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1132,7 +1151,7 @@ async def cmd_deposit(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("orders"))
+@dp.message(Command("orders"), StateFilter("*"))
 async def cmd_orders(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1140,9 +1159,8 @@ async def cmd_orders(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("settings"))
-@dp.message(Command("profile"))
-@dp.message(F.text.in_({"👤 Profile", "Profile"}))
+@dp.message(Command("settings", "profile"), StateFilter("*"))
+@dp.message(F.text.in_({"👤 Profile", "Profile"}), StateFilter("*"))
 async def cmd_profile(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
@@ -1150,37 +1168,41 @@ async def cmd_profile(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("support"))
-@dp.message(F.text.in_({"💬 Support", "Support"}))
+@dp.message(Command("support"), StateFilter("*"))
+@dp.message(F.text.in_({"💬 Support", "Support"}), StateFilter("*"))
 async def cmd_support(m: Message, state: FSMContext):
     await state.clear()
+    await ensure_user(m.from_user)
     txt, kb = support_view()
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("search"))
+@dp.message(Command("search"), StateFilter("*"))
 async def cmd_search(m: Message, state: FSMContext):
+    await ensure_user(m.from_user)
     await state.set_state(SearchSt.q)
     b = InlineKeyboardBuilder()
     b.row(Btn(text="❌ Cancel", callback_data="shop:folders", style="danger"))
     await safe_answer(m, "🔍 <b>Search Products</b>\nEnter a product or brand keyword:", reply_markup=b.as_markup())
 
 
-@dp.message(Command("api"))
+@dp.message(Command("api"), StateFilter("*"))
 async def cmd_api_info(m: Message, state: FSMContext):
     await state.clear()
+    await ensure_user(m.from_user)
     txt, kb = support_view(api_inquiry=True)
     await safe_answer(m, txt, reply_markup=kb)
 
 
-@dp.message(Command("cancel"))
+@dp.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel(m: Message, state: FSMContext):
     await state.clear()
+    await ensure_user(m.from_user)
     txt = await welcome_text(m.from_user)
     await safe_answer(m, txt, reply_markup=main_menu())
 
 
-@dp.callback_query(F.data == "home")
+@dp.callback_query(F.data == "home", StateFilter("*"))
 async def cb_home(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
@@ -1340,7 +1362,6 @@ async def build_folders_view(force: bool = False):
 
     b = InlineKeyboardBuilder()
 
-    # Top 3 favourite products pinned above folders
     for fp in fav_products:
         _, ce_id = detect_product_icon(fp)
         btn_style = "success" if fp["ok"] else "danger"
@@ -1353,7 +1374,6 @@ async def build_folders_view(force: bool = False):
             )
         )
 
-    # 3-column category folders
     folder_btns = []
     show_all = ST.get("show_empty_folders", False) or len(ps) == 0
     for cid, label, icon, _ in CATEGORIES:
@@ -1399,7 +1419,6 @@ async def build_product_list_view(mode: str, page: int, force: bool = False):
     else:
         cid = mode.split(":", 1)[1]
         cat_items = [p for p in ps if detect_category(p) == cid]
-        # Strictly keep only favourites that belong to this category folder
         pinned_favs = [p_by_id[pid] for pid in FAVS[:3] if pid in p_by_id and detect_category(p_by_id[pid]) == cid]
         origin_prefix = f"cat-{cid}-{page}"
         page_cb_prefix = f"cat:{cid}"
@@ -1439,7 +1458,7 @@ async def cb_noop(c: CallbackQuery):
     await c.answer()
 
 
-@dp.callback_query(F.data.in_({"shop:0", "shop:folders", "shop:folders:ref"}))
+@dp.callback_query(F.data.in_({"shop:0", "shop:folders", "shop:folders:ref"}), StateFilter("*"))
 async def cb_shop_folders(c: CallbackQuery, state: FSMContext):
     force = c.data.endswith(":ref")
     await c.answer("Refreshed!" if force else None)
@@ -1497,7 +1516,7 @@ async def search_input(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=b.as_markup())
 
 
-# Product view with [-] [qty] [+] stepper, Custom Quantity, and Purchase Now -> Payment Method
+# Product view with [-] [qty] [+] stepper, Custom Quantity, and Purchase Now
 def resolve_back_cb(origin: str) -> str:
     if not origin or origin == "folders":
         return "shop:folders"
@@ -1606,7 +1625,7 @@ async def qty_in(m: Message, state: FSMContext):
     await safe_answer(m, txt, reply_markup=kb)
 
 
-# Purchase Now -> Payment Method Selection (Wallet on top, Direct Pay Binance & Bybit below)
+# Purchase Now -> Payment Method Selection
 @dp.callback_query(F.data.startswith("paym:"))
 async def cb_pay_methods(c: CallbackQuery):
     parts = c.data.split(":", 3)
@@ -1669,7 +1688,7 @@ async def cb_wallet_buy(c: CallbackQuery):
         await execute_product_order(uid, u.full_name, u.username, p, qty, total, "wallet", target_msg=c)
 
 
-# Direct Pay (Binance & Bybit) for immediate product purchase
+# Direct Pay (Binance & Bybit)
 @dp.callback_query(F.data.startswith("dpay:"))
 async def cb_direct_pay_start(c: CallbackQuery, state: FSMContext):
     _, method, pid, qty_s, cents_s = c.data.split(":")
@@ -1726,7 +1745,7 @@ async def direct_pay_tx_in(m: Message, state: FSMContext):
     await process_crypto_verification(wait, m.from_user, req_id)
 
 
-# Deposit Flow (Vertical buttons, no minimum text on Binance/Bybit, bKash amount -> BDT rate -> Admin Bot verify)
+# Deposit Flow
 def deposit_menu_view():
     b = InlineKeyboardBuilder()
     b.row(Btn(text="🟡 Binance", callback_data="dep:binance", style="success"))
@@ -1781,7 +1800,7 @@ async def cb_dep_method(c: CallbackQuery, state: FSMContext):
     await safe_edit(c, txt, reply_markup=b.as_markup())
 
 
-# bKash Step 1: User enters USDT amount -> Bot multiplies by BDT_RATE and asks for TrxID
+# bKash Step 1 & Step 2
 @dp.message(Dep.bk_amt, F.text)
 async def bk_amt_in(m: Message, state: FSMContext):
     try:
@@ -1808,7 +1827,6 @@ async def bk_amt_in(m: Message, state: FSMContext):
     )
 
 
-# bKash Step 2: User enters TrxID -> Sends to Admin Bot for approval
 @dp.message(Dep.bk_trx, F.text)
 async def bk_trx_in(m: Message, state: FSMContext):
     trx = m.text.strip().upper()
@@ -1830,12 +1848,13 @@ async def bk_trx_in(m: Message, state: FSMContext):
     await state.clear()
     await safe_answer(m, "⏳ <b>Your deposit is being verified by admin.</b>")
 
+    u = m.from_user
+    t_str = await bd_now()
     ab = InlineKeyboardBuilder()
     ab.row(
         Btn(text="✅ Approve", callback_data=f"adm:bk:ok:{rid}", style="success"),
         Btn(text="❌ Reject", callback_data=f"adm:bk:no:{rid}", style="danger"),
     )
-    u = m.from_user
     await notify_admin(
         f"🟣 <b>bKash Deposit Verification (#{rid})</b>\n\n"
         f"👤 <b>User:</b> {esc(u.full_name)} (@{esc(u.username or 'N/A')})\n"
@@ -1844,9 +1863,17 @@ async def bk_trx_in(m: Message, state: FSMContext):
         f"🧾 <b>TrxID:</b> <code>{esc(trx)}</code>",
         reply_markup=ab.as_markup(),
     )
+    await send_log(
+        f"⏳ <b>BKASH VERIFICATION SUBMITTED</b>\n\n"
+        f"👤 <b>User:</b> {esc(u.full_name)} (@{esc(u.username or 'N/A')})\n"
+        f"🆔 <b>User ID:</b> <code>{u.id}</code>\n"
+        f"💵 <b>Requested:</b> <code>{usdt_amt} USDT</code> ({bdt_amt} BDT)\n"
+        f"🧾 <b>TrxID:</b> <code>{esc(trx)}</code>\n"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+    )
 
 
-# Binance & Bybit Wallet Deposit: User sends TxID -> 30s + 10s verification flow
+# Binance & Bybit Wallet Deposit
 @dp.message(Dep.txid, F.text)
 async def dep_tx_in(m: Message, state: FSMContext):
     txid = m.text.strip()
@@ -1878,17 +1905,25 @@ async def process_crypto_verification(wait_msg: Message, user, req_id: int):
     attempts = req["attempts"]
 
     amt = await run_two_stage_verification(wait_msg, method, txid)
+    t_str = await bd_now()
 
-    # Check if valid and sufficient for Direct Pay
     if amt and amt > 0:
         if kind == "direct":
             expected = req["expected_usdt"]
             if amt >= expected:
                 if await mark_tx_used(method, txid, user.id, amt):
                     await pool.execute("UPDATE manual_verifications SET status='completed' WHERE id=$1", req_id)
-                    # If user sent extra USDT on direct pay, credit the remainder to their wallet
                     if amt > expected:
                         await credit(user.id, q2(amt - expected))
+                    await send_log(
+                        f"✅ <b>VERIFICATION SUCCESSFUL (DIRECT PAY)</b>\n\n"
+                        f"👤 <b>User:</b> {esc(user.full_name)} (@{esc(user.username or 'N/A')})\n"
+                        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+                        f"💳 <b>Method:</b> <code>{method.upper()}</code>\n"
+                        f"💵 <b>Verified Amount:</b> <code>{amt} USDT</code>\n"
+                        f"🧾 <b>TxID:</b> <code>{esc(txid)}</code>\n"
+                        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+                    )
                     p = await find(req["pid"], force=True)
                     if not p or not p["ok"] or (p["stock"] is not None and p["stock"] < req["qty"]):
                         await credit(user.id, expected)
@@ -1906,7 +1941,6 @@ async def process_crypto_verification(wait_msg: Message, user, req_id: int):
                     )
                     return
         else:
-            # Wallet deposit: add whatever amount was found in the transaction
             if await credit_deposit(method, txid, user.id, amt):
                 await pool.execute("UPDATE manual_verifications SET status='completed' WHERE id=$1", req_id)
                 bal = await balance(user.id)
@@ -1919,19 +1953,28 @@ async def process_crypto_verification(wait_msg: Message, user, req_id: int):
                     f"💰 <b>Total Balance:</b> <code>{bal} USDT</code>",
                     reply_markup=b.as_markup(),
                 )
-                bd_time = await pool.fetchval("SELECT to_char(now() AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD HH12:MI:SS AM')")
                 await send_log(
-                    f"💵 <b>DEPOSIT LOG</b>\n\n"
+                    f"✅ <b>VERIFICATION SUCCESSFUL (DEPOSIT)</b>\n\n"
                     f"👤 <b>User:</b> {esc(user.full_name)} (@{esc(user.username or 'N/A')})\n"
                     f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
                     f"💳 <b>Method:</b> <code>{method.upper()} (Auto)</code>\n"
                     f"➕ <b>Amount:</b> <code>{amt} USDT</code>\n"
                     f"🧾 <b>TxID:</b> <code>{esc(txid)}</code>\n"
-                    f"🕒 <b>Time (BD):</b> <code>{bd_time}</code>"
+                    f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
                 )
                 return
 
-    # Verification Failed UI
+    # Log failed automatic verification attempt
+    await send_log(
+        f"❌ <b>VERIFICATION FAILED (ATTEMPT {attempts}/2)</b>\n\n"
+        f"👤 <b>User:</b> {esc(user.full_name)} (@{esc(user.username or 'N/A')})\n"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"📌 <b>Type:</b> <code>{kind.upper()}</code>\n"
+        f"💳 <b>Method:</b> <code>{method.upper()}</code>\n"
+        f"🧾 <b>TxID:</b> <code>{esc(txid)}</code>\n"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+    )
+
     b = InlineKeyboardBuilder()
     if attempts < 2:
         b.row(Btn(text="🔄 Try Again", callback_data=f"vretry:{req_id}", style="primary"))
@@ -1986,6 +2029,7 @@ async def cb_verify_manual_escalate(c: CallbackQuery):
         Btn(text="❌ Reject", callback_data=f"adm:mv:no:{req_id}", style="danger"),
     )
     kind_label = f"Direct Purchase ({req['expected_usdt']} USDT)" if req["kind"] == "direct" else "Wallet Deposit"
+    t_str = await bd_now()
     await notify_admin(
         f"🧾 <b>Manual Verification Request (#{req_id})</b>\n\n"
         f"👤 <b>User:</b> {esc(req['full_name'])} (@{esc(req['username'] or 'N/A')})\n"
@@ -1995,9 +2039,29 @@ async def cb_verify_manual_escalate(c: CallbackQuery):
         f"🧾 <b>TxID:</b> <code>{esc(req['txid'])}</code>",
         reply_markup=ab.as_markup(),
     )
+    await send_log(
+        f"👨‍💼 <b>MANUAL VERIFICATION REQUESTED</b>\n\n"
+        f"👤 <b>User:</b> {esc(req['full_name'])} (@{esc(req['username'] or 'N/A')})\n"
+        f"🆔 <b>User ID:</b> <code>{req['user_id']}</code>\n"
+        f"📌 <b>Type:</b> {kind_label}\n"
+        f"💳 <b>Method:</b> <code>{req['method'].upper()}</code>\n"
+        f"🧾 <b>TxID:</b> <code>{esc(req['txid'])}</code>\n"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+    )
 
 
-# Admin Bot Panel & Handlers (Runs on ADMIN_BOT_TOKEN, restricted to ADMIN_IDS)
+# Admin Bot Panel & Handlers (StateFilter("*") on top-level commands so /admin always opens)
+def adm_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KBtn(text="🛠 Admin Panel", style="success"), KBtn(text="⏳ Pending", style="primary")],
+            [KBtn(text="⭐ Top 3 Favourites", style="primary"), KBtn(text="📊 Stats", style="primary")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def adm_menu():
     b = InlineKeyboardBuilder()
     b.row(
@@ -2029,10 +2093,11 @@ def back_adm():
     return b.as_markup()
 
 
-@adm.message(CommandStart())
-@adm.message(Command("admin"))
+@adm.message(Command("start", "admin", "cancel"), StateFilter("*"))
+@adm.message(F.text.in_({"🛠 Admin Panel", "Admin Panel", "/admin", "/start"}), StateFilter("*"))
 async def adm_cmd(m: Message, state: FSMContext):
     await state.clear()
+    await safe_answer(m, "⚡", reply_markup=adm_reply_kb())
     await safe_answer(
         m,
         "🛠 <b>Admin Control Panel</b>\nManage products, Top 3 Favourites, payments, balances, and store settings:",
@@ -2040,7 +2105,28 @@ async def adm_cmd(m: Message, state: FSMContext):
     )
 
 
-@adm.callback_query(F.data == "adm")
+@adm.message(F.text == "⏳ Pending", StateFilter("*"))
+async def adm_Quick_pending(m: Message, state: FSMContext):
+    await state.clear()
+    txt, kb = await build_adm_pending_view()
+    await safe_answer(m, txt, reply_markup=kb)
+
+
+@adm.message(F.text == "⭐ Top 3 Favourites", StateFilter("*"))
+async def adm_quick_favs(m: Message, state: FSMContext):
+    await state.clear()
+    txt, kb = await build_adm_favs_view()
+    await safe_answer(m, txt, reply_markup=kb)
+
+
+@adm.message(F.text == "📊 Stats", StateFilter("*"))
+async def adm_quick_stats(m: Message, state: FSMContext):
+    await state.clear()
+    txt = await build_adm_stats_text()
+    await safe_answer(m, txt, reply_markup=back_adm())
+
+
+@adm.callback_query(F.data == "adm", StateFilter("*"))
 async def adm_home(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
@@ -2051,10 +2137,8 @@ async def adm_home(c: CallbackQuery, state: FSMContext):
     )
 
 
-# Admin: Pending Verifications (bKash + Manual Crypto + Timeout Orders)
-@adm.callback_query(F.data == "adm:pending")
-async def adm_pending(c: CallbackQuery):
-    await c.answer()
+# Admin: Pending Verifications
+async def build_adm_pending_view():
     bk_rows = await pool.fetch("SELECT id,user_id,trx,usdt_amount,amount_bdt FROM bkash WHERE status='pending' ORDER BY id ASC LIMIT 8")
     mv_rows = await pool.fetch("SELECT id,user_id,kind,method,txid,expected_usdt FROM manual_verifications WHERE status='manual_pending' ORDER BY id ASC LIMIT 8")
     ord_rows = await pool.fetch("SELECT id,order_code,user_id,product,qty,cost FROM orders WHERE status='pending' ORDER BY id ASC LIMIT 5")
@@ -2091,11 +2175,19 @@ async def adm_pending(c: CallbackQuery):
             )
 
     b.row(Btn(text="◀️ Admin Panel", callback_data="adm", style="primary"))
-    await safe_edit(c, "\n".join(lines), reply_markup=b.as_markup())
+    return "\n".join(lines), b.as_markup()
+
+
+@adm.callback_query(F.data == "adm:pending", StateFilter("*"))
+async def adm_pending(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    txt, kb = await build_adm_pending_view()
+    await safe_edit(c, txt, reply_markup=kb)
 
 
 # Admin: bKash Approve / Reject
-@adm.callback_query(F.data.startswith("adm:bk:ok:") | F.data.startswith("adm:bk:no:"))
+@adm.callback_query(F.data.startswith("adm:bk:ok:") | F.data.startswith("adm:bk:no:"), StateFilter("*"))
 async def cb_adm_bk_decide(c: CallbackQuery):
     _, _, act, rid_s = c.data.split(":")
     rid = int(rid_s)
@@ -2108,8 +2200,13 @@ async def cb_adm_bk_decide(c: CallbackQuery):
         return await c.answer("Already processed.", show_alert=True)
     await c.answer("Processed!")
 
+    u_row = await pool.fetchrow("SELECT username, name FROM users WHERE id=$1", r["user_id"])
+    u_name = u_row["name"] if u_row else f"User {r['user_id']}"
+    u_uname = u_row["username"] if u_row else None
+    t_str = await bd_now()
+    usdt = r["usdt_amount"] or q2(r["amount_bdt"] / BDT_RATE)
+
     if act == "ok":
-        usdt = r["usdt_amount"] or q2(r["amount_bdt"] / BDT_RATE)
         await credit_deposit("bkash", r["trx"], r["user_id"], usdt)
         new_bal = await balance(r["user_id"])
         kb = InlineKeyboardBuilder()
@@ -2121,22 +2218,30 @@ async def cb_adm_bk_decide(c: CallbackQuery):
             f"💰 <b>Total Balance:</b> <code>{new_bal} USDT</code>",
             reply_markup=kb.as_markup(),
         )
-        bd_time = await pool.fetchval("SELECT to_char(now() AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD HH12:MI:SS AM')")
         await send_log(
-            f"🟣 <b>BKASH DEPOSIT LOG</b>\n\n"
+            f"✅ <b>BKASH VERIFICATION APPROVED</b>\n\n"
+            f"👤 <b>User:</b> {esc(u_name)} (@{esc(u_uname or 'N/A')})\n"
             f"🆔 <b>User ID:</b> <code>{r['user_id']}</code>\n"
             f"➕ <b>Added:</b> <code>{usdt} USDT</code> ({r['amount_bdt']} BDT)\n"
             f"🧾 <b>TrxID:</b> <code>{esc(r['trx'])}</code>\n"
-            f"🕒 <b>Time (BD):</b> <code>{bd_time}</code>"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
         )
     else:
         await safe_bot_send(bot, r["user_id"], "❌ <b>Your bKash deposit request was rejected by admin.</b>")
+        await send_log(
+            f"❌ <b>BKASH VERIFICATION REJECTED</b>\n\n"
+            f"👤 <b>User:</b> {esc(u_name)} (@{esc(u_uname or 'N/A')})\n"
+            f"🆔 <b>User ID:</b> <code>{r['user_id']}</code>\n"
+            f"💵 <b>Amount:</b> <code>{usdt} USDT</code> ({r['amount_bdt']} BDT)\n"
+            f"🧾 <b>TrxID:</b> <code>{esc(r['trx'])}</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
 
     await safe_edit(c, (c.message.html_text or c.message.text) + f"\n\n➡️ <b>{new_st.upper()}</b>")
 
 
 # Admin: Manual Crypto Verification Approve / Reject
-@adm.callback_query(F.data.startswith("adm:mv:ok:") | F.data.startswith("adm:mv:no:"))
+@adm.callback_query(F.data.startswith("adm:mv:ok:") | F.data.startswith("adm:mv:no:"), StateFilter("*"))
 async def cb_adm_mv_decide(c: CallbackQuery, state: FSMContext):
     _, _, act, req_id_s = c.data.split(":")
     req_id = int(req_id_s)
@@ -2144,10 +2249,19 @@ async def cb_adm_mv_decide(c: CallbackQuery, state: FSMContext):
     if not req or req["status"] in ("completed", "approved", "rejected"):
         return await c.answer("Already processed.", show_alert=True)
 
+    t_str = await bd_now()
     if act == "no":
         await pool.execute("UPDATE manual_verifications SET status='rejected' WHERE id=$1", req_id)
         await c.answer("Rejected.")
         await safe_bot_send(bot, req["user_id"], f"❌ <b>Manual verification for TxID <code>{esc(req['txid'])}</code> was rejected.</b>")
+        await send_log(
+            f"❌ <b>MANUAL VERIFICATION REJECTED</b>\n\n"
+            f"👤 <b>User:</b> {esc(req['full_name'])} (@{esc(req['username'] or 'N/A')})\n"
+            f"🆔 <b>User ID:</b> <code>{req['user_id']}</code>\n"
+            f"💳 <b>Method:</b> <code>{req['method'].upper()}</code>\n"
+            f"🧾 <b>TxID:</b> <code>{esc(req['txid'])}</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
         return await safe_edit(c, (c.message.html_text or c.message.text) + "\n\n➡️ <b>REJECTED</b>")
 
     if req["kind"] == "direct":
@@ -2155,6 +2269,15 @@ async def cb_adm_mv_decide(c: CallbackQuery, state: FSMContext):
         await mark_tx_used(req["method"], req["txid"], req["user_id"], req["expected_usdt"])
         await c.answer("Approved & delivering product!")
         await safe_edit(c, (c.message.html_text or c.message.text) + "\n\n➡️ <b>APPROVED (Delivering Product)</b>")
+        await send_log(
+            f"✅ <b>MANUAL VERIFICATION APPROVED (DIRECT PAY)</b>\n\n"
+            f"👤 <b>User:</b> {esc(req['full_name'])} (@{esc(req['username'] or 'N/A')})\n"
+            f"🆔 <b>User ID:</b> <code>{req['user_id']}</code>\n"
+            f"💳 <b>Method:</b> <code>{req['method'].upper()}</code>\n"
+            f"💵 <b>Amount:</b> <code>{req['expected_usdt']} USDT</code>\n"
+            f"🧾 <b>TxID:</b> <code>{esc(req['txid'])}</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
         p = await find(req["pid"], force=True)
         if p and p["ok"]:
             await execute_product_order(
@@ -2208,21 +2331,21 @@ async def adm_man_amt_in(m: Message, state: FSMContext):
         f"💰 <b>Total Balance:</b> <code>{new_bal} USDT</code>",
         reply_markup=kb.as_markup(),
     )
-    bd_time = await pool.fetchval("SELECT to_char(now() AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD HH12:MI:SS AM')")
+    t_str = await bd_now()
     await send_log(
-        f"💵 <b>MANUAL DEPOSIT LOG</b>\n\n"
+        f"✅ <b>MANUAL DEPOSIT APPROVED</b>\n\n"
         f"👤 <b>User:</b> {esc(req['full_name'])} (@{esc(req['username'] or 'N/A')})\n"
         f"🆔 <b>User ID:</b> <code>{req['user_id']}</code>\n"
         f"💳 <b>Method:</b> <code>{req['method'].upper()} (Admin Verified)</code>\n"
         f"➕ <b>Amount:</b> <code>{amt} USDT</code>\n"
         f"🧾 <b>TxID:</b> <code>{esc(req['txid'])}</code>\n"
-        f"🕒 <b>Time (BD):</b> <code>{bd_time}</code>"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
     )
     await safe_answer(m, f"✅ Credited <b>{amt} USDT</b> to User <code>{req['user_id']}</code>!", reply_markup=adm_menu())
 
 
 # Admin: Pending Timeout Order Resolution
-@adm.callback_query(F.data.startswith("adm:ord:ok:") | F.data.startswith("adm:ord:ref:"))
+@adm.callback_query(F.data.startswith("adm:ord:ok:") | F.data.startswith("adm:ord:ref:"), StateFilter("*"))
 async def cb_adm_ord_resolve(c: CallbackQuery):
     _, _, act, oid_s = c.data.split(":")
     oid = int(oid_s)
@@ -2230,9 +2353,17 @@ async def cb_adm_ord_resolve(c: CallbackQuery):
     if not r:
         return await c.answer("Order already resolved.", show_alert=True)
     await c.answer("Resolved!")
+    t_str = await bd_now()
     if act == "ok":
         await pool.execute("UPDATE orders SET status='done' WHERE id=$1", oid)
         await safe_bot_send(bot, r["user_id"], f"✅ Your order <code>{r['order_code']}</code> ({esc(r['product'])}) has been confirmed!")
+        await send_log(
+            f"✅ <b>PENDING ORDER CONFIRMED</b>\n\n"
+            f"🆔 <b>Order ID:</b> <code>{r['order_code']}</code> (#{oid})\n"
+            f"🆔 <b>User ID:</b> <code>{r['user_id']}</code>\n"
+            f"📦 <b>Item:</b> {esc(r['product'])} ×{r['qty']}\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
         await safe_edit(c, (c.message.html_text or c.message.text) + "\n\n➡️ <b>MARKED DELIVERED</b>")
     else:
         await pool.execute("UPDATE orders SET status='failed' WHERE id=$1", oid)
@@ -2245,11 +2376,18 @@ async def cb_adm_ord_resolve(c: CallbackQuery):
             f"💸 Order <code>{r['order_code']}</code> was refunded: <b>+{r['cost']} USDT</b>\n💰 Total Balance: <code>{new_bal} USDT</code>",
             reply_markup=kb.as_markup(),
         )
+        await send_log(
+            f"💸 <b>PENDING ORDER REFUNDED</b>\n\n"
+            f"🆔 <b>Order ID:</b> <code>{r['order_code']}</code> (#{oid})\n"
+            f"🆔 <b>User ID:</b> <code>{r['user_id']}</code>\n"
+            f"💵 <b>Refunded:</b> <code>{r['cost']} USDT</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
         await safe_edit(c, (c.message.html_text or c.message.text) + "\n\n➡️ <b>REFUNDED TO USER</b>")
 
 
 # Admin: Interactive Balance Manager
-@adm.callback_query(F.data == "adm:bal")
+@adm.callback_query(F.data == "adm:bal", StateFilter("*"))
 async def cb_adm_bal(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.set_state(Adm.bal_uid)
@@ -2281,6 +2419,7 @@ async def adm_bal_amt_in(m: Message, state: FSMContext):
     uid = (await state.get_data())["target_uid"]
     await state.clear()
     new_bal = await credit(uid, amt)
+    t_str = await bd_now()
     if amt > 0:
         kb = InlineKeyboardBuilder()
         kb.row(Btn(text="🛍 Shop", callback_data="shop:folders", style="success"))
@@ -2289,13 +2428,18 @@ async def adm_bal_amt_in(m: Message, state: FSMContext):
             f"✅ <b>{amt} USDT has been added to your balance!</b>\n💰 <b>Total Balance:</b> <code>{new_bal} USDT</code>",
             reply_markup=kb.as_markup(),
         )
+    await send_log(
+        f"💳 <b>ADMIN BALANCE ADJUSTMENT</b>\n\n"
+        f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+        f"➕ <b>Change:</b> <code>{amt:+} USDT</code>\n"
+        f"💰 <b>New Balance:</b> <code>{new_bal} USDT</code>\n"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+    )
     await safe_answer(m, f"✅ Updated! User <code>{uid}</code> new balance: <b>{new_bal} USDT</b>", reply_markup=adm_menu())
 
 
 # Admin: Top 3 Favourites Manager
-@adm.callback_query(F.data == "adm:favs")
-async def adm_favs_view(c: CallbackQuery):
-    await c.answer()
+async def build_adm_favs_view():
     ps = await get_products(True)
     p_by_id = {str(p["id"]): p for p in ps}
     b = InlineKeyboardBuilder()
@@ -2318,28 +2462,38 @@ async def adm_favs_view(c: CallbackQuery):
     if FAVS:
         b.row(Btn(text="🗑 Clear All Favourites", callback_data="adm:fav:clear", style="danger"))
     b.row(Btn(text="◀️ Admin Panel", callback_data="adm", style="primary"))
-    await safe_edit(c, "\n".join(lines), reply_markup=b.as_markup())
+    return "\n".join(lines), b.as_markup()
 
 
-@adm.callback_query(F.data.startswith("adm:fav:rm:"))
-async def adm_fav_rm(c: CallbackQuery):
+@adm.callback_query(F.data == "adm:favs", StateFilter("*"))
+async def adm_favs_view(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    txt, kb = await build_adm_favs_view()
+    await safe_edit(c, txt, reply_markup=kb)
+
+
+@adm.callback_query(F.data.startswith("adm:fav:rm:"), StateFilter("*"))
+async def adm_fav_rm(c: CallbackQuery, state: FSMContext):
     pid = c.data.split(":", 3)[3]
     if pid in FAVS:
         FAVS.remove(pid)
         await save_favs()
     await c.answer("Removed!")
-    await adm_favs_view(c)
+    txt, kb = await build_adm_favs_view()
+    await safe_edit(c, txt, reply_markup=kb)
 
 
-@adm.callback_query(F.data == "adm:fav:clear")
-async def adm_fav_clear(c: CallbackQuery):
+@adm.callback_query(F.data == "adm:fav:clear", StateFilter("*"))
+async def adm_fav_clear(c: CallbackQuery, state: FSMContext):
     FAVS.clear()
     await save_favs()
     await c.answer("Cleared!")
-    await adm_favs_view(c)
+    txt, kb = await build_adm_favs_view()
+    await safe_edit(c, txt, reply_markup=kb)
 
 
-@adm.callback_query(F.data.startswith("adm:fav:tg:"))
+@adm.callback_query(F.data.startswith("adm:fav:tg:"), StateFilter("*"))
 async def adm_fav_toggle(c: CallbackQuery):
     pid = c.data.split(":", 3)[3]
     if pid in FAVS:
@@ -2355,7 +2509,7 @@ async def adm_fav_toggle(c: CallbackQuery):
     await render_adm_product(c, pid)
 
 
-@adm.callback_query(F.data.startswith("adm:fav:rep:"))
+@adm.callback_query(F.data.startswith("adm:fav:rep:"), StateFilter("*"))
 async def adm_fav_replace(c: CallbackQuery):
     _, _, _, slot_s, pid = c.data.split(":", 4)
     slot = int(slot_s)
@@ -2375,7 +2529,7 @@ async def adm_fav_replace(c: CallbackQuery):
 
 
 # Admin: Folder Options & Contact Settings
-@adm.callback_query(F.data == "adm:fopt")
+@adm.callback_query(F.data == "adm:fopt", StateFilter("*"))
 async def adm_fopt(c: CallbackQuery):
     await c.answer()
     empty_st = "ON (Show all 24 folders)" if ST.get("show_empty_folders") else "OFF (Only active folders)"
@@ -2385,7 +2539,7 @@ async def adm_fopt(c: CallbackQuery):
     await safe_edit(c, f"📁 <b>Folder Display Options</b>\n\n<b>Show Empty Folders:</b> <code>{empty_st}</code>", reply_markup=b.as_markup())
 
 
-@adm.callback_query(F.data == "adm:fopt:empty")
+@adm.callback_query(F.data == "adm:fopt:empty", StateFilter("*"))
 async def adm_fopt_empty(c: CallbackQuery):
     ST["show_empty_folders"] = not ST.get("show_empty_folders", False)
     val = "1" if ST["show_empty_folders"] else "0"
@@ -2393,7 +2547,7 @@ async def adm_fopt_empty(c: CallbackQuery):
     await adm_fopt(c)
 
 
-@adm.callback_query(F.data == "adm:contact")
+@adm.callback_query(F.data == "adm:contact", StateFilter("*"))
 async def adm_contact(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
@@ -2412,7 +2566,7 @@ async def adm_contact(c: CallbackQuery, state: FSMContext):
     await safe_edit(c, txt, reply_markup=b.as_markup())
 
 
-@adm.callback_query(F.data.in_({"adm:contact:setnum", "adm:contact:setwa"}))
+@adm.callback_query(F.data.in_({"adm:contact:setnum", "adm:contact:setwa"}), StateFilter("*"))
 async def adm_contact_prompt(c: CallbackQuery, state: FSMContext):
     field = "contact_number" if c.data.endswith("setnum") else "whatsapp_link"
     await state.set_state(Adm.contact)
@@ -2435,9 +2589,7 @@ async def adm_contact_save(m: Message, state: FSMContext):
 TODAY = "(created AT TIME ZONE 'Asia/Dhaka')::date = (now() AT TIME ZONE 'Asia/Dhaka')::date"
 
 
-@adm.callback_query(F.data == "adm:stats")
-async def adm_stats(c: CallbackQuery):
-    await c.answer()
+async def build_adm_stats_text() -> str:
     r = await pool.fetchrow(f"""SELECT
       (SELECT count(*) FROM users) users,
       (SELECT coalesce(sum(balance),0) FROM users) bal,
@@ -2463,10 +2615,17 @@ async def adm_stats(c: CallbackQuery):
         f"<b>Top Products:</b>\n"
     )
     t += "\n".join(f"• {esc(x['product'][:35])} — {x['q']}" for x in top) or "—"
+    return t
+
+
+@adm.callback_query(F.data == "adm:stats", StateFilter("*"))
+async def adm_stats(c: CallbackQuery):
+    await c.answer()
+    t = await build_adm_stats_text()
     await safe_edit(c, t, reply_markup=back_adm())
 
 
-@adm.callback_query(F.data == "adm:orders")
+@adm.callback_query(F.data == "adm:orders", StateFilter("*"))
 async def adm_orders(c: CallbackQuery):
     await c.answer()
     rows = await pool.fetch(
@@ -2481,7 +2640,7 @@ async def adm_orders(c: CallbackQuery):
     await safe_edit(c, t if rows else "No orders yet.", reply_markup=back_adm())
 
 
-@adm.callback_query(F.data == "adm:api")
+@adm.callback_query(F.data == "adm:api", StateFilter("*"))
 async def adm_api(c: CallbackQuery):
     await c.answer()
     try:
@@ -2493,7 +2652,7 @@ async def adm_api(c: CallbackQuery):
     await safe_edit(c, f"🏦 <b>Shop API Balance:</b>\n<code>{esc(txt[:500])}</code>", reply_markup=back_adm())
 
 
-@adm.callback_query(F.data == "adm:rule")
+@adm.callback_query(F.data == "adm:rule", StateFilter("*"))
 async def adm_rule(c: CallbackQuery):
     await c.answer()
     b = InlineKeyboardBuilder()
@@ -2510,7 +2669,7 @@ async def adm_rule(c: CallbackQuery):
     )
 
 
-@adm.callback_query(F.data == "adm:rule:set")
+@adm.callback_query(F.data == "adm:rule:set", StateFilter("*"))
 async def adm_rule_set(c: CallbackQuery, state: FSMContext):
     await state.set_state(Adm.rule)
     await c.message.answer("Enter new pricing rule (<code>a2.5</code> / <code>p10</code> / <code>m2</code>):", parse_mode="HTML")
@@ -2528,7 +2687,7 @@ async def adm_rule_in(m: Message, state: FSMContext):
     await safe_answer(m, f"✅ Rule set to: <code>{esc(rule_text(r))}</code>", reply_markup=adm_menu())
 
 
-@adm.callback_query(F.data == "adm:rule:reset")
+@adm.callback_query(F.data == "adm:rule:reset", StateFilter("*"))
 async def adm_rule_reset(c: CallbackQuery):
     await pool.execute("DELETE FROM settings WHERE key='pricing'")
     ST["rule"] = ENV_RULE
@@ -2536,9 +2695,10 @@ async def adm_rule_reset(c: CallbackQuery):
     await adm_rule(c)
 
 
-@adm.callback_query(F.data.startswith("adm:pl:"))
-async def adm_pl(c: CallbackQuery):
+@adm.callback_query(F.data.startswith("adm:pl:"), StateFilter("*"))
+async def adm_pl(c: CallbackQuery, state: FSMContext):
     await c.answer()
+    await state.clear()
     await render_pl(c, int(c.data.split(":")[2]))
 
 
@@ -2613,13 +2773,14 @@ async def render_adm_product(c: CallbackQuery, pid: str):
     )
 
 
-@adm.callback_query(F.data.startswith("adm:p:"))
-async def adm_p(c: CallbackQuery):
+@adm.callback_query(F.data.startswith("adm:p:"), StateFilter("*"))
+async def adm_p(c: CallbackQuery, state: FSMContext):
     await c.answer()
+    await state.clear()
     await render_adm_product(c, c.data.split(":")[2])
 
 
-@adm.callback_query(F.data.startswith("adm:cat:"))
+@adm.callback_query(F.data.startswith("adm:cat:"), StateFilter("*"))
 async def adm_cat_select(c: CallbackQuery):
     await c.answer()
     pid = c.data.split(":")[2]
@@ -2632,7 +2793,7 @@ async def adm_cat_select(c: CallbackQuery):
     await safe_edit(c, f"📁 <b>Select Folder for Product <code>{esc(pid)}</code>:</b>", reply_markup=b.as_markup())
 
 
-@adm.callback_query(F.data.startswith("adm:setcat:"))
+@adm.callback_query(F.data.startswith("adm:setcat:"), StateFilter("*"))
 async def adm_cat_save(c: CallbackQuery):
     _, _, pid, cid = c.data.split(":", 3)
     if cid == "auto":
@@ -2646,7 +2807,7 @@ async def adm_cat_save(c: CallbackQuery):
     await render_adm_product(c, pid)
 
 
-@adm.callback_query(F.data.startswith("adm:ps:"))
+@adm.callback_query(F.data.startswith("adm:ps:"), StateFilter("*"))
 async def adm_ps(c: CallbackQuery, state: FSMContext):
     await state.set_state(Adm.price)
     await state.update_data(pid=c.data.split(":")[2])
@@ -2668,7 +2829,7 @@ async def adm_price_in(m: Message, state: FSMContext):
     await safe_answer(m, f"✅ Price set to <code>{v} USDT</code>", reply_markup=adm_menu())
 
 
-@adm.callback_query(F.data.startswith("adm:pr:"))
+@adm.callback_query(F.data.startswith("adm:pr:"), StateFilter("*"))
 async def adm_pr(c: CallbackQuery):
     pid = c.data.split(":")[2]
     await pool.execute("DELETE FROM overrides WHERE pid=$1", pid)
@@ -2677,7 +2838,7 @@ async def adm_pr(c: CallbackQuery):
     await render_adm_product(c, pid)
 
 
-@adm.callback_query(F.data == "adm:prall")
+@adm.callback_query(F.data == "adm:prall", StateFilter("*"))
 async def adm_prall(c: CallbackQuery):
     await pool.execute("DELETE FROM overrides")
     OVR.clear()
@@ -2685,7 +2846,7 @@ async def adm_prall(c: CallbackQuery):
     await render_pl(c, 0)
 
 
-@adm.callback_query(F.data.startswith("adm:ns:"))
+@adm.callback_query(F.data.startswith("adm:ns:"), StateFilter("*"))
 async def adm_ns(c: CallbackQuery, state: FSMContext):
     await state.set_state(Adm.note)
     await state.update_data(pid=c.data.split(":")[2])
@@ -2705,7 +2866,7 @@ async def adm_note_in(m: Message, state: FSMContext):
     await safe_answer(m, "✅ Note saved!", reply_markup=adm_menu())
 
 
-@adm.callback_query(F.data.startswith("adm:nr:"))
+@adm.callback_query(F.data.startswith("adm:nr:"), StateFilter("*"))
 async def adm_nr(c: CallbackQuery):
     pid = c.data.split(":")[2]
     await pool.execute("DELETE FROM notes WHERE pid=$1", pid)
@@ -2714,12 +2875,14 @@ async def adm_nr(c: CallbackQuery):
     await render_adm_product(c, pid)
 
 
-@adm.message(Command("addbal"))
-async def addbal(m: Message):
+@adm.message(Command("addbal"), StateFilter("*"))
+async def addbal(m: Message, state: FSMContext):
+    await state.clear()
     try:
         _, uid_s, amt_s = m.text.split()
         uid, amt = int(uid_s), q2(D(amt_s))
         nb = await credit(uid, amt)
+        t_str = await bd_now()
         await m.answer(f"✅ Updated! User <code>{uid}</code> balance: <b>{nb} USDT</b>", parse_mode="HTML")
         if amt > 0:
             kb = InlineKeyboardBuilder()
@@ -2729,6 +2892,13 @@ async def addbal(m: Message):
                 f"✅ <b>{amt} USDT has been added to your balance!</b>\n💰 <b>Total Balance:</b> <code>{nb} USDT</code>",
                 reply_markup=kb.as_markup(),
             )
+        await send_log(
+            f"💳 <b>ADMIN BALANCE ADJUSTMENT</b>\n\n"
+            f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+            f"➕ <b>Change:</b> <code>{amt:+} USDT</code>\n"
+            f"💰 <b>New Balance:</b> <code>{nb} USDT</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
     except Exception:
         await m.answer("Usage: <code>/addbal USER_ID AMOUNT</code>", parse_mode="HTML")
 
@@ -2739,7 +2909,16 @@ adm_dp.include_router(adm)
 @adm_dp.message()
 async def adm_unauthorized(m: Message):
     if m.from_user and m.from_user.id not in ADMINS:
-        await m.answer("⛔ Access restricted to authorized administrators.")
+        await m.answer(f"⛔ Access denied. Your User ID (<code>{m.from_user.id}</code>) is not in ADMIN_IDS.", parse_mode="HTML")
+
+
+# Log Bot start handler so admins can initialize chat with the Log Bot
+@log_dp.message(CommandStart())
+async def log_bot_start(m: Message):
+    if m.from_user and m.from_user.id in ADMINS:
+        await m.answer("📋 <b>Log Bot Active!</b>\nAll store events (new users, verifications, deposits, and purchases) will be sent here automatically.", parse_mode="HTML")
+    else:
+        await m.answer("⛔ Access restricted.")
 
 
 # Global error handlers
@@ -2755,7 +2934,13 @@ async def admin_error_handler(event: ErrorEvent):
     return True
 
 
-# Slash commands setup
+@log_dp.error()
+async def log_error_handler(event: ErrorEvent):
+    logging.error("Log bot error: %s", event.exception, exc_info=True)
+    return True
+
+
+# Slash commands setup (clears any previously cached /admin command from Customer Bot)
 async def setup_bot_commands():
     user_cmds = [
         BotCommand(command="start", description="Open the main menu"),
@@ -2767,19 +2952,33 @@ async def setup_bot_commands():
         BotCommand(command="api", description="Reseller API access"),
     ]
     try:
+        await bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
         await bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
+        for aid in ADMINS:
+            try:
+                await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=aid))
+                await bot.set_my_commands(user_cmds, scope=BotCommandScopeChat(chat_id=aid))
+            except Exception:
+                pass
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     except Exception as e:
         logging.warning("Customer bot commands setup warning: %s", e)
 
-    if ADMIN_BOT_TOKEN and admin_bot:
+    if ADMIN_BOT_TOKEN and admin_bot and ADMIN_BOT_TOKEN != BOT_TOKEN:
         admin_cmds = [
-            BotCommand(command="start", description="Open Admin Control Panel"),
             BotCommand(command="admin", description="Open Admin Control Panel"),
+            BotCommand(command="start", description="Open Admin Control Panel"),
             BotCommand(command="addbal", description="Add or deduct user balance"),
         ]
         try:
             await admin_bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
+            for aid in ADMINS:
+                try:
+                    await admin_bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=aid))
+                except Exception:
+                    pass
             await admin_bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except Exception as e:
             logging.warning("Admin bot commands setup warning: %s", e)
@@ -2801,13 +3000,16 @@ async def main():
     await setup_bot_commands()
     await bot.delete_webhook(drop_pending_updates=True)
 
-    tasks = [dp.start_polling(bot)]
+    tasks = [dp.start_polling(bot, handle_signals=False)]
     if ADMIN_BOT_TOKEN and ADMIN_BOT_TOKEN != BOT_TOKEN:
         await admin_bot.delete_webhook(drop_pending_updates=True)
-        tasks.append(adm_dp.start_polling(admin_bot))
+        tasks.append(adm_dp.start_polling(admin_bot, handle_signals=False))
     else:
-        # Fallback if ADMIN_BOT_TOKEN is not yet provided separately
         dp.include_router(adm)
+
+    if LOG_BOT_TOKEN and LOG_BOT_TOKEN not in (BOT_TOKEN, ADMIN_BOT_TOKEN):
+        await log_bot.delete_webhook(drop_pending_updates=True)
+        tasks.append(log_dp.start_polling(log_bot, handle_signals=False))
 
     await asyncio.gather(*tasks)
 
