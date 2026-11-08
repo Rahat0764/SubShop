@@ -143,6 +143,8 @@ class Adm(StatesGroup):
     bal_uid = State()
     bal_amt = State()
     man_amt = State()
+    up_uid = State()
+    up_rule = State()
 
 
 # Button builders and safe message helpers
@@ -335,12 +337,17 @@ PRODUCT_BRAND_ICONS = [
 ]
 
 # Pricing and runtime state
-RULE_RE = re.compile(r"^\s*([apm])\s*(\d+(?:\.\d+)?)\s*$", re.I)
+RULE_RE = re.compile(r"^\s*([apm])\s*([+-]?\d+(?:\.\d+)?)\s*$", re.I)
 
 
 def parse_rule(s):
     m = RULE_RE.match(s or "")
-    return (m.group(1).lower(), D(m.group(2))) if m else None
+    if not m:
+        return None
+    k, v = m.group(1).lower(), D(m.group(2))
+    if k == "m" and v <= 0:
+        return None
+    return (k, v)
 
 
 def apply_rule(base, rule):
@@ -351,11 +358,38 @@ def apply_rule(base, rule):
 
 def rule_text(rule):
     k, v = rule
+    sign = "+" if v >= 0 else ""
     return {
-        "a": f"a{v} (Base + {v} USDT)",
-        "p": f"p{v} (Base + {v}%)",
-        "m": f"m{v} (Base × {v})",
+        "a": f"a{v} (Price {sign}{v} USDT)",
+        "p": f"p{v} (Price {sign}{v}%)",
+        "m": f"m{v} (Price × {v})",
     }[k]
+
+
+def user_rule_change_info(rule) -> tuple[str, str]:
+    """Returns (direction, formatted_amount) where direction is 'discount', 'increase', or 'neutral'."""
+    k, v = rule
+    if k == "a":
+        if v < 0:
+            return "discount", f"{abs(v)} USDT"
+        if v > 0:
+            return "increase", f"{v} USDT"
+        return "neutral", "0 USDT"
+    if k == "p":
+        if v < 0:
+            return "discount", f"{abs(v)}%"
+        if v > 0:
+            return "increase", f"{v}%"
+        return "neutral", "0%"
+    if k == "m":
+        if v < 1:
+            pct = q2((Decimal("1") - v) * 100)
+            return "discount", f"{pct}% (×{v})"
+        if v > 1:
+            pct = q2((v - Decimal("1")) * 100)
+            return "increase", f"{pct}% (×{v})"
+        return "neutral", "×1"
+    return "neutral", ""
 
 
 ENV_RULE = parse_rule(PRICING_ENV) or ("a", D("2.5"))
@@ -369,6 +403,7 @@ OVR = {}
 NOTES = {}
 FAVS = []
 CAT_OVR = {}
+USER_RULES: dict[int, tuple[str, Decimal]] = {}
 
 
 def detect_category(p: dict) -> str:
@@ -471,22 +506,26 @@ def note_for(p):
     return ("\n\n".join(parts), "safwan") if parts else ("", "none")
 
 
-def sell_price(p):
+def sell_price(p, uid: int = None):
     o = OVR.get(str(p["id"]))
-    return o if o is not None else apply_rule(p["price"], ST["rule"])
+    std_price = o if o is not None else apply_rule(p["price"], ST["rule"])
+    if uid is not None and int(uid) in USER_RULES:
+        return apply_rule(std_price, USER_RULES[int(uid)])
+    return std_price
 
 
-def format_product_btn_text(p: dict, max_name_len: int = 34) -> str:
+def format_product_btn_text(p: dict, max_name_len: int = 34, uid: int = None) -> str:
     icon, _ = detect_product_icon(p)
     name = p["name"]
     if len(name) > max_name_len:
         name = name[: max_name_len - 1].rstrip() + "…"
-    price_str = f"{sell_price(p):f}".rstrip("0").rstrip(".") if "." in f"{sell_price(p):f}" else f"{sell_price(p)}"
+    sp = sell_price(p, uid)
+    price_str = f"{sp:f}".rstrip("0").rstrip(".") if "." in f"{sp:f}" else f"{sp}"
     stk_str = "∞" if p["stock"] is None else (str(p["stock"]) if p["ok"] else "0")
     return f"{icon} {name} - {price_str}USDT (Stock: {stk_str})"
 
 
-def make_product_btn(p: dict, is_fav: bool = False, origin: str = "all-0") -> InlineKeyboardButton:
+def make_product_btn(p: dict, is_fav: bool = False, origin: str = "all-0", uid: int = None) -> InlineKeyboardButton:
     _, ce_id = detect_product_icon(p)
     if not p["ok"] or (p["stock"] is not None and p["stock"] <= 0):
         style = "danger"
@@ -495,7 +534,7 @@ def make_product_btn(p: dict, is_fav: bool = False, origin: str = "all-0") -> In
     else:
         style = "primary"
     return Btn(
-        text=format_product_btn_text(p),
+        text=format_product_btn_text(p, uid=uid),
         callback_data=f"p:{p['id']}:1:{origin}",
         style=style,
         icon_custom_emoji_id=ce_id,
@@ -580,6 +619,11 @@ async def init_db():
         pid TEXT PRIMARY KEY,
         cat_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_pricing(
+        user_id BIGINT PRIMARY KEY,
+        rule TEXT NOT NULL,
+        updated TIMESTAMPTZ DEFAULT now()
+    );
     """)
 
     await pool.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_code TEXT;")
@@ -588,7 +632,7 @@ async def init_db():
 
     for t in (
         "users", "deposits", "orders", "overrides", "settings",
-        "bkash", "notes", "favorites", "product_categories", "manual_verifications"
+        "bkash", "notes", "favorites", "product_categories", "manual_verifications", "user_pricing"
     ):
         try:
             await pool.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
@@ -610,6 +654,12 @@ async def init_db():
     CAT_OVR.clear()
     for r in await pool.fetch("SELECT pid, cat_id FROM product_categories"):
         CAT_OVR[str(r["pid"])] = str(r["cat_id"])
+
+    USER_RULES.clear()
+    for r in await pool.fetch("SELECT user_id, rule FROM user_pricing"):
+        pr = parse_rule(r["rule"])
+        if pr:
+            USER_RULES[int(r["user_id"])] = pr
 
     rows = await pool.fetch("SELECT key, value FROM settings")
     s_map = {r["key"]: r["value"] for r in rows}
@@ -1155,7 +1205,7 @@ async def cmd_start(m: Message, state: FSMContext):
 async def cmd_products(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user)
-    txt, kb = await build_folders_view()
+    txt, kb = await build_folders_view(uid=m.from_user.id)
     await safe_answer(m, txt, reply_markup=kb)
 
 
@@ -1383,7 +1433,7 @@ async def cb_order_view(c: CallbackQuery):
 PAGE = 8
 
 
-async def build_folders_view(force: bool = False):
+async def build_folders_view(force: bool = False, uid: int = None):
     ps = await get_products(force=force)
     p_by_id = {str(p["id"]): p for p in ps}
     fav_products = [p_by_id[pid] for pid in FAVS if pid in p_by_id][:3]
@@ -1401,7 +1451,7 @@ async def build_folders_view(force: bool = False):
         btn_style = "success" if fp["ok"] else "danger"
         b.row(
             Btn(
-                text=format_product_btn_text(fp),
+                text=format_product_btn_text(fp, uid=uid),
                 callback_data=f"p:{fp['id']}:1:folders",
                 style=btn_style,
                 icon_custom_emoji_id=ce_id,
@@ -1440,7 +1490,7 @@ async def build_folders_view(force: bool = False):
     return "🛍 <b>Select a Category or Product:</b>", b.as_markup()
 
 
-async def build_product_list_view(mode: str, page: int, force: bool = False):
+async def build_product_list_view(mode: str, page: int, force: bool = False, uid: int = None):
     ps = await get_products(force=force)
     p_by_id = {str(p["id"]): p for p in ps}
     fav_set = set(FAVS[:3])
@@ -1472,7 +1522,7 @@ async def build_product_list_view(mode: str, page: int, force: bool = False):
 
     for p in slice_items:
         is_fav = str(p["id"]) in fav_set
-        b.row(make_product_btn(p, is_fav=is_fav, origin=origin_prefix))
+        b.row(make_product_btn(p, is_fav=is_fav, origin=origin_prefix, uid=uid))
 
     nav = [Btn(text="🔄 Refresh", callback_data=f"{page_cb_prefix}:{page}:ref", style="success")]
     if page > 0:
@@ -1497,7 +1547,7 @@ async def cb_shop_folders(c: CallbackQuery, state: FSMContext):
     force = c.data.endswith(":ref")
     await c.answer("Refreshed!" if force else None)
     await state.clear()
-    txt, kb = await build_folders_view(force=force)
+    txt, kb = await build_folders_view(force=force, uid=c.from_user.id)
     await safe_edit(c, txt, reply_markup=kb)
 
 
@@ -1507,7 +1557,7 @@ async def cb_all_items(c: CallbackQuery):
     page = int(parts[1])
     force = len(parts) > 2 and parts[2] == "ref"
     await c.answer("Refreshed!" if force else None)
-    txt, kb = await build_product_list_view("all", page, force=force)
+    txt, kb = await build_product_list_view("all", page, force=force, uid=c.from_user.id)
     await safe_edit(c, txt, reply_markup=kb)
 
 
@@ -1518,7 +1568,7 @@ async def cb_cat_items(c: CallbackQuery):
     page = int(parts[2]) if len(parts) > 2 else 0
     force = len(parts) > 3 and parts[3] == "ref"
     await c.answer("Refreshed!" if force else None)
-    txt, kb = await build_product_list_view(f"cat:{cid}", page, force=force)
+    txt, kb = await build_product_list_view(f"cat:{cid}", page, force=force, uid=c.from_user.id)
     await safe_edit(c, txt, reply_markup=kb)
 
 
@@ -1541,7 +1591,7 @@ async def search_input(m: Message, state: FSMContext):
     matches = [p for p in ps if q in p["name"].lower() or q in detect_category(p)]
     b = InlineKeyboardBuilder()
     for p in matches[:20]:
-        b.row(make_product_btn(p, is_fav=(str(p["id"]) in fav_set), origin="folders"))
+        b.row(make_product_btn(p, is_fav=(str(p["id"]) in fav_set), origin="folders", uid=m.from_user.id))
     b.row(
         Btn(text="🔍 Search Again", callback_data="search", style="primary"),
         Btn(text="◀️ Categories", callback_data="shop:folders", style="danger"),
@@ -1562,11 +1612,11 @@ def resolve_back_cb(origin: str) -> str:
     return "shop:folders"
 
 
-def render_product_detail(p: dict, qty: int, origin: str):
+def render_product_detail(p: dict, qty: int, origin: str, uid: int = None):
     icon, _ = detect_product_icon(p)
     max_stk = p["stock"] if p["stock"] is not None else 100
     qty = max(1, min(qty, max(1, max_stk)))
-    unit_p = sell_price(p)
+    unit_p = sell_price(p, uid=uid)
     total_p = q2(unit_p * qty)
     st_text = "Unlimited" if p["stock"] is None else (str(p["stock"]) if p["ok"] else "0 (Out of Stock)")
     note, _ = note_for(p)
@@ -1622,7 +1672,7 @@ async def cb_product(c: CallbackQuery):
     else:
         await c.answer()
 
-    txt, kb = render_product_detail(p, qty, origin)
+    txt, kb = render_product_detail(p, qty, origin, uid=c.from_user.id)
     await safe_edit(c, txt, reply_markup=kb)
 
 
@@ -1655,7 +1705,7 @@ async def qty_in(m: Message, state: FSMContext):
     if not 1 <= n <= mx:
         return await m.answer(f"Please enter a number between 1 and {mx}.")
     await state.clear()
-    txt, kb = render_product_detail(p, n, st_data.get("origin", "folders"))
+    txt, kb = render_product_detail(p, n, st_data.get("origin", "folders"), uid=m.from_user.id)
     await safe_answer(m, txt, reply_markup=kb)
 
 
@@ -1670,7 +1720,7 @@ async def cb_pay_methods(c: CallbackQuery):
         return await c.answer("❌ Insufficient stock.", show_alert=True)
     await c.answer()
 
-    unit_p = sell_price(p)
+    unit_p = sell_price(p, uid=c.from_user.id)
     total = q2(unit_p * qty)
     cents = int(total * 100)
     bal = await balance(c.from_user.id)
@@ -1709,11 +1759,11 @@ async def cb_wallet_buy(c: CallbackQuery):
         p = await find(pid, force=True)
         if not p or not p["ok"] or (p["stock"] is not None and p["stock"] < qty):
             return await c.answer("❌ Out of stock.", show_alert=True)
-        total = q2(sell_price(p) * qty)
+        total = q2(sell_price(p, uid=uid) * qty)
         if int(total * 100) != int(cents_s):
             b = InlineKeyboardBuilder()
             b.row(Btn(text="🔄 View Updated Price", callback_data=f"p:{pid}:{qty}:folders", style="primary"))
-            return await safe_edit(c, f"⚠️ Price changed to <code>{sell_price(p)} USDT</code>.", reply_markup=b.as_markup())
+            return await safe_edit(c, f"⚠️ Price changed to <code>{sell_price(p, uid=uid)} USDT</code>.", reply_markup=b.as_markup())
         if await deduct(uid, total) is None:
             return await c.answer("❌ Insufficient wallet balance! Please deposit or use Direct Pay.", show_alert=True)
         await c.answer()
@@ -1732,7 +1782,7 @@ async def cb_direct_pay_start(c: CallbackQuery, state: FSMContext):
         return await c.answer("❌ Out of stock.", show_alert=True)
     await c.answer()
 
-    total = q2(sell_price(p) * qty)
+    total = q2(sell_price(p, uid=c.from_user.id) * qty)
     await state.set_state(DirectPay.txid)
     await state.update_data(method=method, pid=str(pid), qty=qty, total=str(total))
 
@@ -2112,6 +2162,9 @@ def adm_menu():
     )
     b.row(
         Btn(text="⚙️ Pricing Rule", callback_data="adm:rule", style="primary"),
+        Btn(text="👥 User Pricing (/pricingm)", callback_data="adm:uprice", style="success"),
+    )
+    b.row(
         Btn(text="📞 Contact Settings", callback_data="adm:contact", style="primary"),
     )
     b.row(
@@ -2462,12 +2515,18 @@ async def adm_bal_amt_in(m: Message, state: FSMContext):
     await state.clear()
     new_bal = await credit(uid, amt)
     t_str = await bd_now()
+    kb = InlineKeyboardBuilder()
+    kb.row(Btn(text="🛍 Shop", callback_data="shop:folders", style="success"))
     if amt > 0:
-        kb = InlineKeyboardBuilder()
-        kb.row(Btn(text="🛍 Shop", callback_data="shop:folders", style="success"))
         await safe_bot_send(
             bot, uid,
             f"✅ <b>{amt} USDT has been added to your balance!</b>\n💰 <b>Total Balance:</b> <code>{new_bal} USDT</code>",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await safe_bot_send(
+            bot, uid,
+            f"⚠️ <b>{abs(amt)} USDT has been deducted from your balance by admin.</b>\n💰 <b>Total Balance:</b> <code>{new_bal} USDT</code>",
             reply_markup=kb.as_markup(),
         )
     await send_log(
@@ -2917,6 +2976,190 @@ async def adm_nr(c: CallbackQuery):
     await render_adm_product(c, pid)
 
 
+async def apply_and_notify_user_pricing(uid: int, raw_rule: str) -> tuple[bool, str]:
+    """Saves or resets custom pricing rule for a specific user and sends instant notification."""
+    raw = raw_rule.strip().lower()
+    t_str = await bd_now()
+    kb = InlineKeyboardBuilder()
+    kb.row(Btn(text="🛍 Browse Products", callback_data="shop:folders", style="success"))
+
+    if raw in ("reset", "off", "none", "default", "0", "a0", "p0", "m1"):
+        await pool.execute("DELETE FROM user_pricing WHERE user_id=$1", uid)
+        USER_RULES.pop(uid, None)
+        await safe_bot_send(
+            bot,
+            uid,
+            "ℹ️ <b>Pricing Update Notice</b>\n\nYour account pricing has been reset to standard store rates.",
+            reply_markup=kb.as_markup(),
+        )
+        await send_log(
+            f"♻️ <b>USER PRICING RESET</b>\n\n"
+            f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+            f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+        )
+        return True, f"♻️ Custom pricing rule reset for User <code>{uid}</code>."
+
+    r = parse_rule(raw)
+    if not r:
+        return False, "⚠️ Invalid rule format! Examples:\n• <code>a-1</code> (-1 USDT discount)\n• <code>a1.5</code> (+1.5 USDT increase)\n• <code>p-10</code> (-10% discount)\n• <code>m0.9</code> (×0.9 multiplier)\n• <code>reset</code> (remove custom rule)"
+
+    direction, amt_text = user_rule_change_info(r)
+    if direction == "neutral":
+        return await apply_and_notify_user_pricing(uid, "reset")
+
+    await pool.execute(
+        "INSERT INTO user_pricing(user_id,rule,updated) VALUES($1,$2,now()) "
+        "ON CONFLICT(user_id) DO UPDATE SET rule=$2, updated=now()",
+        uid, raw,
+    )
+    USER_RULES[uid] = r
+
+    if direction == "discount":
+        await safe_bot_send(
+            bot,
+            uid,
+            f"🎉 <b>Congratulations! Exclusive Discount Activated!</b>\n\n"
+            f"💎 Admin has reduced your price by <b>{amt_text}</b> across all products in our store!\n"
+            f"✨ Your special VIP pricing is now live on every item.",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await safe_bot_send(
+            bot,
+            uid,
+            f"⚠️ <b>Sorry! Pricing Update Notice</b>\n\n"
+            f"📈 Your account pricing has been increased by <b>{amt_text}</b> across all products.",
+            reply_markup=kb.as_markup(),
+        )
+
+    await send_log(
+        f"🏷 <b>CUSTOM USER PRICING SET</b>\n\n"
+        f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+        f"⚙️ <b>Rule:</b> <code>{esc(rule_text(r))}</code> ({direction.upper()}: {amt_text})\n"
+        f"🕒 <b>Time (BD):</b> <code>{t_str}</code>"
+    )
+    return True, f"✅ Custom pricing for User <code>{uid}</code> set to <b>{esc(rule_text(r))}</b> ({direction}: {amt_text}). Customer has been notified!"
+
+
+@adm.message(Command("pricingm"), StateFilter("*"))
+async def cmd_pricingm(m: Message, state: FSMContext):
+    await state.clear()
+    parts = m.text.strip().split()
+    if len(parts) != 3 or not parts[1].isdigit():
+        return await m.answer(
+            "⚙️ <b>Set Specific Customer Pricing</b>\n\n"
+            "<b>Usage:</b> <code>/pricingm USER_ID RULE</code>\n"
+            "• Discount 1 USDT: <code>/pricingm 6927361223 a-1</code>\n"
+            "• Discount 10%: <code>/pricingm 6927361223 p-10</code>\n"
+            "• Multiply ×0.85: <code>/pricingm 6927361223 m0.85</code>\n"
+            "• Increase 1 USDT: <code>/pricingm 6927361223 a1</code>\n"
+            "• Reset user: <code>/pricingm 6927361223 reset</code>",
+            parse_mode="HTML",
+            reply_markup=adm_menu(),
+        )
+    uid = int(parts[1])
+    ok, msg = await apply_and_notify_user_pricing(uid, parts[2])
+    await safe_answer(m, msg, reply_markup=adm_menu())
+
+
+async def build_adm_uprice_view():
+    rows = await pool.fetch(
+        "SELECT up.user_id, up.rule, u.name, u.username "
+        "FROM user_pricing up LEFT JOIN users u ON u.id = up.user_id "
+        "ORDER BY up.updated DESC LIMIT 20"
+    )
+    b = InlineKeyboardBuilder()
+    lines = [
+        "👥 <b>Custom Customer Pricing Rules</b>\n",
+        "Command shortcut: <code>/pricingm USER_ID a-1</code>\n",
+    ]
+    if not rows:
+        lines.append("<i>No custom customer pricing rules set right now.</i>")
+    else:
+        for r in rows:
+            uid = r["user_id"]
+            pr = parse_rule(r["rule"])
+            r_txt = rule_text(pr) if pr else r["rule"]
+            u_label = f"{r['name'] or 'User'} (@{r['username']})" if r["username"] else (r["name"] or f"User {uid}")
+            lines.append(f"• <code>{uid}</code> {esc(u_label[:22])} → <b>{esc(r_txt)}</b>")
+            b.row(Btn(text=f"❌ Reset {uid} ({r['rule']})", callback_data=f"adm:up:rm:{uid}", style="danger"))
+
+    b.row(Btn(text="➕ Add / Update Customer Rule", callback_data="adm:up:add", style="success"))
+    if rows:
+        b.row(Btn(text="♻️ Reset All Custom User Rules", callback_data="adm:up:clear", style="danger"))
+    b.row(Btn(text="◀️ Admin Panel", callback_data="adm", style="primary"))
+    return "\n".join(lines), b.as_markup()
+
+
+@adm.callback_query(F.data == "adm:uprice", StateFilter("*"))
+async def cb_adm_uprice(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    txt, kb = await build_adm_uprice_view()
+    await safe_edit(c, txt, reply_markup=kb)
+
+
+@adm.callback_query(F.data == "adm:up:add", StateFilter("*"))
+async def cb_adm_up_add(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(Adm.up_uid)
+    await safe_edit(
+        c,
+        "👥 <b>Set Customer Custom Pricing</b>\n\nSend the customer's numeric <b>Telegram User ID</b>:",
+        reply_markup=back_adm(),
+    )
+
+
+@adm.message(Adm.up_uid, F.text)
+async def adm_up_uid_in(m: Message, state: FSMContext):
+    if not m.text.strip().isdigit():
+        return await m.answer("⚠️ Please enter a valid numeric Telegram User ID.")
+    uid = int(m.text.strip())
+    cur = USER_RULES.get(uid)
+    cur_txt = rule_text(cur) if cur else "Standard Store Pricing"
+    await state.set_state(Adm.up_rule)
+    await state.update_data(target_uid=uid)
+    await m.answer(
+        f"👤 User <code>{uid}</code> current rule: <b>{esc(cur_txt)}</b>\n\n"
+        f"Send the rule to apply on top of store prices:\n"
+        f"• <code>a-1</code> (Reduce price by 1 USDT)\n"
+        f"• <code>p-10</code> (Reduce price by 10%)\n"
+        f"• <code>m0.9</code> (Multiply price by 0.9)\n"
+        f"• <code>a1</code> (Increase price by 1 USDT)\n"
+        f"• <code>reset</code> (Reset to standard pricing)",
+        parse_mode="HTML",
+    )
+
+
+@adm.message(Adm.up_rule, F.text)
+async def adm_up_rule_in(m: Message, state: FSMContext):
+    uid = (await state.get_data())["target_uid"]
+    ok, msg = await apply_and_notify_user_pricing(uid, m.text.strip())
+    if not ok:
+        return await m.answer(msg, parse_mode="HTML")
+    await state.clear()
+    txt, kb = await build_adm_uprice_view()
+    await safe_answer(m, msg + "\n\n" + txt, reply_markup=kb)
+
+
+@adm.callback_query(F.data.startswith("adm:up:rm:"), StateFilter("*"))
+async def cb_adm_up_rm(c: CallbackQuery):
+    uid = int(c.data.split(":")[3])
+    await c.answer("Reset!")
+    await apply_and_notify_user_pricing(uid, "reset")
+    txt, kb = await build_adm_uprice_view()
+    await safe_edit(c, txt, reply_markup=kb)
+
+
+@adm.callback_query(F.data == "adm:up:clear", StateFilter("*"))
+async def cb_adm_up_clear(c: CallbackQuery):
+    await pool.execute("DELETE FROM user_pricing")
+    USER_RULES.clear()
+    await c.answer("All custom user pricing rules reset!")
+    txt, kb = await build_adm_uprice_view()
+    await safe_edit(c, txt, reply_markup=kb)
+
+
 @adm.message(Command("addbal"), StateFilter("*"))
 async def addbal(m: Message, state: FSMContext):
     await state.clear()
@@ -2926,12 +3169,18 @@ async def addbal(m: Message, state: FSMContext):
         nb = await credit(uid, amt)
         t_str = await bd_now()
         await m.answer(f"✅ Updated! User <code>{uid}</code> balance: <b>{nb} USDT</b>", parse_mode="HTML")
+        kb = InlineKeyboardBuilder()
+        kb.row(Btn(text="🛍 Shop", callback_data="shop:folders", style="success"))
         if amt > 0:
-            kb = InlineKeyboardBuilder()
-            kb.row(Btn(text="🛍 Shop", callback_data="shop:folders", style="success"))
             await safe_bot_send(
                 bot, uid,
                 f"✅ <b>{amt} USDT has been added to your balance!</b>\n💰 <b>Total Balance:</b> <code>{nb} USDT</code>",
+                reply_markup=kb.as_markup(),
+            )
+        else:
+            await safe_bot_send(
+                bot, uid,
+                f"⚠️ <b>{abs(amt)} USDT has been deducted from your balance by admin.</b>\n💰 <b>Total Balance:</b> <code>{nb} USDT</code>",
                 reply_markup=kb.as_markup(),
             )
         await send_log(
@@ -3015,8 +3264,9 @@ async def setup_bot_commands():
     if ADMIN_BOT_TOKEN and admin_bot and ADMIN_BOT_TOKEN != BOT_TOKEN:
         admin_cmds = [
             BotCommand(command="admin", description="Open Admin Control Panel"),
-            BotCommand(command="start", description="Open Admin Control Panel"),
+            BotCommand(command="pricingm", description="Set user pricing (/pricingm ID a-1)"),
             BotCommand(command="addbal", description="Add or deduct user balance"),
+            BotCommand(command="start", description="Open Admin Control Panel"),
         ]
         try:
             await admin_bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
